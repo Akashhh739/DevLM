@@ -1,0 +1,31 @@
+node_modules/
+dist/
+.DS_Store
+.env
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# python
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# openclaw runtime artifacts
+snapshots/
+
+# private docs
+docs/portfolio-strategy.md
+
+# learning stages + tests
+stages/
+tests/
+
+# private runbooks (contain real service internals) — commit *.example.md only
+rules/*.md
+!rules/*.example.md
+
+# agent memory (runtime-generated, deployment-specific)
+memory/

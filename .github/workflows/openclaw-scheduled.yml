@@ -1,0 +1,68 @@
+name: OpenClaw scheduled analysis
+
+# On-demand by design — this workflow is the external scheduler.
+on:
+  schedule:
+    - cron: "0 8 * * *" # daily at 08:00 UTC (edit to taste)
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Time window (e.g. 24h, 7d)"
+        default: "24h"
+      sources:
+        description: "Comma-separated sources"
+        default: "loki,cloudflare,sentry"
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout OpenClaw
+        uses: actions/checkout@v4
+
+      # Optional: check out the service repo so the agent can read its code + git.
+      # Set repo variable SERVICE_REPO (owner/name) and secret SERVICE_REPO_TOKEN.
+      - name: Checkout service repo
+        if: ${{ vars.SERVICE_REPO != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SERVICE_REPO }}
+          token: ${{ secrets.SERVICE_REPO_TOKEN }}
+          path: service
+          fetch-depth: 0 # full history for git_log / git_blame / git_diff
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: pip install -e ".[aws]" # add ,ga4 / ,trace if you use those
+
+      - name: Run OpenClaw
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          LOKI_URL: ${{ secrets.LOKI_URL }}
+          LOKI_NAMESPACE: ${{ secrets.LOKI_NAMESPACE }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          SENTRY_TOKEN: ${{ secrets.SENTRY_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          REPO_PATH: ${{ vars.SERVICE_REPO != '' && 'service' || '.' }}
+        run: |
+          openclaw run \
+            --since "${{ github.event.inputs.since || '24h' }}" \
+            --sources "${{ github.event.inputs.sources || 'loki,cloudflare,sentry' }}"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-report
+          path: snapshots/**/report.md
+          if-no-files-found: ignore

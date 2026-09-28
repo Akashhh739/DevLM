@@ -1,0 +1,14 @@
+# Hard limits the agent must respect in any recommendation.
+# Copy to constraints.yaml and edit.
+scaling:
+  max_replicas: 10
+  min_replicas: 2
+database:
+  max_connections: 100
+budgets:
+  monthly_usd: 500
+slo:
+  availability: "99.9%"
+  p95_latency_ms: 300
+security:
+  never_expose_ports: [22, 5432]
