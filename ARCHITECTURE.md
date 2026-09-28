@@ -18,7 +18,6 @@
 10. [The Warehouse (DuckDB)](#10-the-warehouse-duckdb)
 11. [Every File Explained](#11-every-file-explained)
 12. [Data Flow — End to End](#12-data-flow--end-to-end)
-13. [PR & Interview Questions](#13-pr--interview-questions)
 
 ---
 
@@ -988,72 +987,3 @@ User types: openclaw run --since 7d --sources sentry,cloudwatch_logs
         (output printed to terminal)
 ```
 
----
-
-## 13. PR & Interview Questions
-
-### Architecture
-
-**Q: Why Parquet instead of a real database like Postgres or SQLite?**
-
-Parquet is columnar — DuckDB can read just the columns it needs without loading the full row. For log analysis, you almost always query `severity` and `source` but rarely `raw_json`. A row-oriented store reads all columns on every scan. Parquet also compresses 5–10× better than CSV or SQLite for repetitive string values. The key insight: Parquet + DuckDB gives you SQL with zero operational overhead — no server, no migrations, files you can `cp` or `rm`.
-
-**Q: What does `previous_response_id` in the Responses API do and why does it matter?**
-
-It tells the OpenAI server to thread this request as a continuation of a prior one. The server keeps the conversation history on its side — you only send new `function_call_output` items each turn instead of the full history. Without it, a 10-turn investigation would resend the entire growing context on every iteration, making cost grow quadratically with tool calls. With it, cost is roughly constant per turn.
-
-**Q: Why does the system prompt inject a repo file tree instead of letting the model use `list_dir` to discover paths?**
-
-Without the upfront tree, the model's first action on every run is a `list_dir` call to orient itself — wasting one of the 32 iterations and adding latency. The tree is cheap to generate (a `rglob` walk on a local filesystem) and collapses path discovery into zero turns. The model still has `list_dir` for when it needs to go deeper than the top-80-file snapshot.
-
-**Q: What prevents the agent from reading your `.env` file or other secrets?**
-
-`_confine()` in `tools.py`. It resolves both the root and the target path (handling symlinks and `../` traversal) and checks `target.is_relative_to(root)`. The root is `REPO_PATH` (your backend codebase), not the OpenClaw directory. Even if the model asks for `../../openclaw/.env`, the resolved absolute path doesn't start with `REPO_PATH`, so the call raises a `ToolError` that gets returned to the model as an error string.
-
-**Q: How does the Jev pre-ranker reduce cost?**
-
-It converts up to 10,000 raw signal rows into at most 50 cluster summaries using DuckDB (local, free). It then sends those 50 one-line summaries to a cheap model (~$0.0001) to get importance ordering. The expensive reasoning model then only receives the top 8 clusters (~200 tokens of focus context) instead of thousands of raw log lines. In practice this cuts the expensive model's token consumption by 70–90% on large snapshots.
-
-**Q: Why use structlog instead of the standard library `logging`?**
-
-`structlog` emits JSON by default — every log event is a machine-readable dict (`{"event": "tool_call", "name": "duckdb_query", "iteration": 3, ...}`). This means you can pipe `openclaw run` output through `jq` or ingest it into any log aggregator without parsing. Standard library logging produces human strings that require regex to parse.
-
-### Code design
-
-**Q: Why is `get_settings()` wrapped in `@lru_cache`?**
-
-`Settings()` calls pydantic-settings which reads and validates `.env` on every instantiation. If multiple connectors called `get_settings()` directly, `.env` would be read 16 times per run. `lru_cache` makes it a singleton — parsed once, reused everywhere. Note: this means changing `.env` mid-process has no effect (fine for a CLI tool; would be a bug in a long-running server).
-
-**Q: Why are tools plain methods on a class instead of functions passed as lambdas?**
-
-Unit testability. The `Tools` class can be instantiated with a test `run_dir` pointing at a fixture Parquet file and a test `repo_path`. No mock is needed — you call `tools.duckdb_query("SELECT count(*) FROM signals")` directly and assert on the result. The lambda dispatch in `analyze.py` is a thin adapter on top of these plain methods.
-
-**Q: What happens if a connector raises an exception?**
-
-`runner.py` doesn't catch connector exceptions — they propagate and abort the run. The design choice is intentional: a failing connector means something is wrong with your credentials or the API is down, and you want to know, not silently get zero signals. The exception boundary is the connector's `fetch()` method itself — if the API is unavailable, `fetch()` should catch that specific error, log a warning, and return `[]`. This separates "connector is misconfigured" (hard fail) from "connector is temporarily unavailable" (soft fail, return empty).
-
-**Q: How does `write_fix` work and why is it gated behind `--apply`?**
-
-`apply.py`'s `FixWriter` creates a git branch named `openclaw-fix-<run_id>`, writes the new file content, and commits. This branch is never pushed — it only exists locally. The user must explicitly run `git push` and open a PR themselves. `write_fix` is only added to the tool schema when `--apply` is passed; otherwise the tool doesn't exist in the schema, so the model cannot call it even if it tries.
-
-**Q: What is the `_is_readonly_sql` guard and why is it not enough on its own?**
-
-It checks that the query starts with `SELECT` or `WITH` and doesn't contain mutation keywords. But it's string-matching — a clever query like `SELECT * FROM (DELETE FROM signals RETURNING *)` would not be caught. The deeper defense is that `duckdb.connect(":memory:")` creates a fresh in-memory database with no persistent state. Even if a mutation got through, it would only affect the ephemeral connection, not the Parquet files on disk. The guard is a first line of defence; the in-memory connection is the real backstop.
-
-### Data engineering
-
-**Q: What is columnar storage and why does it matter for this use case?**
-
-In row-oriented storage (Postgres, SQLite), a row's data lives contiguously on disk: `[source, kind, severity, ts, entity, message, raw_json]` for each row. To read `severity` from 10,000 rows you read 10,000 full rows. In columnar storage (Parquet), all `severity` values for all rows live contiguously: `[error, warn, error, info, ...]`. To read `severity` from 10,000 rows you read only the `severity` column. For analytics (`GROUP BY severity, COUNT(*)`) this is 6× less I/O on a 7-column table.
-
-**Q: What does ZSTD compression do to the Parquet file?**
-
-ZSTD (Zstandard) is a modern LZ77-family compression algorithm. For log data with highly repetitive strings (`source="sentry"` appears in every row), ZSTD achieves 5–10× compression versus uncompressed. It's also faster to decompress than gzip. DuckDB decompresses columns in parallel before scanning — the compression overhead is invisible for interactive queries.
-
-**Q: Why does `mart_signals` use `DISTINCT` but the raw connector output doesn't deduplicate?**
-
-Connectors run on time windows. If you run `--since 7d` today and again tomorrow, the last 6 days overlap. Without `DISTINCT`, `build-db` would double-count those signals. Using `DISTINCT` at warehouse build time means the raw Parquet files remain immutable append-only artifacts — you never modify them — and deduplication happens in the aggregation layer where it's cheap (DuckDB hash aggregate).
-
-**Q: What is `severity_rank` in the warehouse and why not just `ORDER BY severity`?**
-
-`severity` is a string — `ORDER BY severity` sorts alphabetically (`critical < error < info < warn`), which is wrong. `severity_rank` maps `critical→4, error→3, warn→2, info→1` so `WHERE severity_rank >= 3` correctly means "errors and above". This is a common data modelling pattern: store the human-readable label for display, store the integer rank for computation.
